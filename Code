@@ -1,0 +1,512 @@
+"""
+This code is designed to run on the JoinQuant research platform and relies on
+JoinQuant-specific APIs and data services. As a result, it cannot be executed directly
+in a standard local Python environment.
+
+Therefore, although this script may not run locally without errors, it is fully
+functional and executable when deployed within the JoinQuant platform with the
+appropriate permissions and data access rights.
+"""
+
+from jqdata import *
+from jqfactor import get_factor_values
+import datetime
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+import warnings
+import pickle
+import lightgbm as lgb
+import xgboost as xgb
+from sklearn.svm import SVR
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+import warnings
+warnings.filterwarnings('ignore')
+
+class MultiModelResearch:
+    """Multi-model ML research framework"""
+    
+    def __init__(self):
+        # Factor list
+        self.jqfactors_list = [
+            'asset_impairment_loss_ttm', 'cash_flow_to_price_ratio', 'market_cap', 
+            'interest_free_current_liability', 'EBITDA', 'financial_assets', 
+            'gross_profit_ttm', 'net_working_capital', 'non_recurring_gain_loss', 'EBIT',
+            'sales_to_price_ratio', 'AR', 'ARBR', 'ATR6', 'DAVOL10', 'MAWVAD', 'TVMA6', 
+            'PSY', 'VOL10', 'VDIFF', 'VEMA26', 'VMACD', 'VOL120', 'VOSC', 'VR', 'WVAD', 
+            'arron_down_25', 'arron_up_25', 'BBIC', 'MASS', 'Rank1M', 'single_day_VPT', 
+            'single_day_VPT_12', 'single_day_VPT_6', 'Volume1M',
+            'capital_reserve_fund_per_share', 'net_asset_per_share', 
+            'net_operate_cash_flow_per_share', 'operating_profit_per_share', 
+            'total_operating_revenue_per_share', 'surplus_reserve_fund_per_share',
+            'ACCA', 'account_receivable_turnover_days', 'account_receivable_turnover_rate', 
+            'adjusted_profit_to_total_profit', 'super_quick_ratio', 'MLEV', 
+            'debt_to_equity_ratio', 'debt_to_tangible_equity_ratio', 
+            'equity_to_fixed_asset_ratio', 'fixed_asset_ratio', 'intangible_asset_ratio', 
+            'invest_income_associates_to_total_profit', 'long_debt_to_asset_ratio',
+            'long_debt_to_working_capital_ratio', 'net_operate_cash_flow_to_total_liability', 
+            'net_operating_cash_flow_coverage', 'non_current_asset_ratio', 
+            'operating_profit_to_total_profit', 'roa_ttm', 'roe_ttm', 'Kurtosis120', 
+            'Kurtosis20', 'Kurtosis60', 'sharpe_ratio_20', 'sharpe_ratio_60', 
+            'Skewness120', 'Skewness20', 'Skewness60', 'Variance120', 'Variance20', 
+            'liquidity', 'beta', 'book_to_price_ratio', 'cash_earnings_to_price_ratio', 
+            'cube_of_size', 'earnings_to_price_ratio', 'earnings_yield', 'growth', 
+            'momentum', 'natural_log_of_market_cap', 'boll_down', 'MFI14', 'MAC10', 
+            'fifty_two_week_close_rank', 'price_no_fq'
+        ]
+        
+        # Model registry
+        self.models_config = {
+            'lgb': {'name': 'LightGBM', 'model': None},
+            'xgb': {'name': 'XGBoost', 'model': None},
+            'svr': {'name': 'SVR', 'model': None},
+            'rf': {'name': 'RandomForest', 'model': None},
+            'lr': {'name': 'LinearRegression', 'model': None},
+            'ensemble': {'name': 'Ensemble', 'model': None}
+        }
+        
+    def get_period_date(self, period, start_date, end_date):
+        """Get date list within a time window."""
+        stock_data = get_price('000001.XSHE', start_date, end_date, 'daily', fields=['close'])
+        stock_data['date'] = stock_data.index
+        period_stock_data = stock_data.resample(period).last()
+        period_stock_data = period_stock_data.set_index('date').dropna()
+        date = period_stock_data.index
+        pydate_array = date.to_pydatetime()
+        date_only_array = np.vectorize(lambda s: s.strftime('%Y-%m-%d'))(pydate_array)
+        date_only_series = pd.Series(date_only_array)
+        start_date_dt = datetime.datetime.strptime(start_date, "%Y-%m-%d")
+        start_date_dt = start_date_dt - datetime.timedelta(days=1)
+        start_date_str = start_date_dt.strftime("%Y-%m-%d")
+        date_list = date_only_series.values.tolist()
+        date_list.insert(0, start_date_str)
+        return date_list
+
+    def filter_new_stocks(self, stocks, begin_date, n=90):
+        """Filter stocks with listing age < n days before begin_date."""
+        stockList = []
+        beginDate = datetime.datetime.strptime(begin_date, "%Y-%m-%d")
+        for stock in stocks:
+            start_date = get_security_info(stock).start_date
+            if start_date < (beginDate - datetime.timedelta(days=n)).date():
+                stockList.append(stock)
+        return stockList
+
+    def get_stock_pool(self, stock_pool, begin_date):
+        """Get universe by pool name on a given date."""
+        if stock_pool == 'HS300':
+            stockList = get_index_stocks('000300.XSHG', begin_date)
+        elif stock_pool == 'ZZ500':
+            stockList = get_index_stocks('399905.XSHE', begin_date)
+        elif stock_pool == 'ZZ800':
+            stockList = get_index_stocks('399906.XSHE', begin_date)
+        elif stock_pool == 'CYBZ':
+            stockList = get_index_stocks('399006.XSHE', begin_date)
+        elif stock_pool == 'ZXBZ':
+            stockList = get_index_stocks('399101.XSHE', begin_date)
+        elif stock_pool == 'A':
+            stockList = get_index_stocks('000002.XSHG', begin_date) + get_index_stocks('399107.XSHE', begin_date)
+            stockList = [stock for stock in stockList if not stock.startswith(('68', '4', '8'))]
+        elif stock_pool == 'AA':
+            stockList = get_index_stocks('000985.XSHG', begin_date)
+            stockList = [stock for stock in stockList if not stock.startswith(('3', '68', '4', '8'))]
+        
+        st_data = get_extras('is_st', stockList, count=1, end_date=begin_date)
+        stockList = [stock for stock in stockList if not st_data[stock][0]]
+        stockList = self.filter_new_stocks(stockList, begin_date)
+        return stockList
+
+    def get_factor_data(self, securities_list, date):
+        """Fetch factor cross-section for a date."""
+        factor_data = get_factor_values(securities=securities_list, factors=self.jqfactors_list, count=1, end_date=date)
+        df_jq_factor = pd.DataFrame(index=securities_list)
+        for factor in factor_data.keys():
+            df_jq_factor[factor] = factor_data[factor].iloc[0, :]
+        return df_jq_factor
+
+    def generate_training_data(self):
+        """Build training set."""
+        print("Generating multi-model training data...")
+        
+        period = 'M'
+        start_date = '2019-01-01'
+        end_date = '2023-01-01'
+        stock_pool = 'ZXBZ'
+        
+        dateList = self.get_period_date(period, start_date, end_date)
+        print(f"Collected {len(dateList)} time points")
+        
+        DF = pd.DataFrame()
+        
+        for i in tqdm(range(len(dateList)-1)):
+            date = dateList[i]
+            next_date = dateList[i+1]
+            
+            try:
+                stockList = self.get_stock_pool(stock_pool, date)
+                if len(stockList) == 0:
+                    continue
+                
+                factor_data = self.get_factor_data(stockList, date)
+                
+                data_close = get_price(stockList, date, next_date, '1d', fields=['close'])['close']
+                factor_data['pchg'] = data_close.iloc[-1] / data_close.iloc[0] - 1
+                
+                factor_data = factor_data.dropna()
+                
+                median_pchg = factor_data['pchg'].median()
+                factor_data['label'] = np.where(factor_data['pchg'] >= median_pchg, 1, 0)
+                factor_data = factor_data.drop(columns=['pchg'])
+                
+                DF = pd.concat([DF, factor_data], ignore_index=True)
+                
+            except Exception as e:
+                print(f"Error on date {date}: {e}")
+                continue
+        
+        selected_features = self.feature_selection(DF)
+        print(f"Selected features: {len(selected_features)}")
+        
+        final_data = DF[selected_features + ['label']]
+        
+        final_data.to_csv('multi_model_train_data.csv', index=False)
+        print(f"Saved training data: multi_model_train_data.csv (shape: {final_data.shape})")
+        
+        with open('multi_model_selected_features.pkl', 'wb') as f:
+            pickle.dump(selected_features, f)
+        print("Saved feature list: multi_model_selected_features.pkl")
+        
+        return final_data, selected_features
+
+    def feature_selection(self, df):
+        """Correlation-based feature selection."""
+        print("Running feature selection...")
+        
+        missing_counts = df[self.jqfactors_list].isnull().sum().to_dict()
+        corr_matrix = df[self.jqfactors_list].corr()
+        
+        graph = {}
+        threshold = 0.6
+        
+        n = len(self.jqfactors_list)
+        for i in range(n):
+            for j in range(i + 1, n):
+                col1, col2 = self.jqfactors_list[i], self.jqfactors_list[j]
+                corr_value = corr_matrix.iloc[i, j]
+                
+                if not pd.isna(corr_value) and abs(corr_value) > threshold:
+                    if col1 not in graph:
+                        graph[col1] = []
+                    graph[col1].append(col2)
+                    
+                    if col2 not in graph:
+                        graph[col2] = []
+                    graph[col2].append(col1)
+        
+        visited = set()
+        components = []
+        
+        def dfs(node, comp):
+            visited.add(node)
+            comp.append(node)
+            if node in graph:
+                for neighbor in graph[node]:
+                    if neighbor not in visited:
+                        dfs(neighbor, comp)
+        
+        for col in self.jqfactors_list:
+            if col not in visited:
+                comp = []
+                dfs(col, comp)
+                components.append(comp)
+        
+        to_keep = []
+        to_remove = []
+        
+        for comp in components:
+            if len(comp) == 1:
+                to_keep.append(comp[0])
+            else:
+                comp_sorted = sorted(comp, key=lambda x: (missing_counts[x], x))
+                keep_feature = comp_sorted[0]
+                to_keep.append(keep_feature)
+                to_remove.extend(comp_sorted[1:])
+        
+        print(f"Removed features: {len(to_remove)}")
+        return to_keep
+
+    def train_models(self):
+        """Train all models."""
+        print("Training multi-model ensemble...")
+        
+        try:
+            df = pd.read_csv('multi_model_train_data.csv')
+            with open('multi_model_selected_features.pkl', 'rb') as f:
+                selected_features = pickle.load(f)
+            print(f"Loaded data: {df.shape}, features: {len(selected_features)}")
+        except Exception as e:
+            print(f"Failed to load data: {e}")
+            return
+        
+        X = df[selected_features]
+        y = df['label']
+        
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+        
+        print(f"Train size: {X_train.shape}, Test size: {X_test.shape}")
+        
+        self.train_lightgbm(X_train, y_train, X_test, y_test)
+        self.train_xgboost(X_train, y_train, X_test, y_test)
+        self.train_svr(X_train, y_train, X_test, y_test)
+        self.train_random_forest(X_train, y_train, X_test, y_test)
+        self.train_linear_regression(X_train, y_train, X_test, y_test)
+        
+        self.create_ensemble_model(X_test, y_test)
+        self.save_all_models(selected_features)
+        
+        print("All models trained.")
+
+    def train_lightgbm(self, X_train, y_train, X_test, y_test):
+
+        print("Training LightGBM...")
+        
+        lgb_train = lgb.Dataset(X_train, y_train)
+        lgb_test = lgb.Dataset(X_test, y_test, reference=lgb_train)
+        
+        params = {
+            'objective': 'binary',
+            'metric': 'binary_logloss',
+            'learning_rate': 0.05,
+            'num_leaves': 31,
+            'max_depth': -1,
+            'min_data_in_leaf': 20,
+            'feature_fraction': 0.8,
+            'bagging_fraction': 0.8,
+            'bagging_freq': 5,
+            'verbosity': -1,
+            'random_state': 42
+        }
+        
+        model = lgb.train(
+            params,
+            lgb_train,
+            num_boost_round=500,
+            valid_sets=[lgb_test],
+            callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False)]
+        )
+        
+        self.models_config['lgb']['model'] = model
+        self.evaluate_model(model, X_test, y_test, 'LightGBM')
+
+    def train_xgboost(self, X_train, y_train, X_test, y_test):
+
+        print("Training XGBoost...")
+        
+        params = {
+            'objective': 'binary:logistic',
+            'learning_rate': 0.05,
+            'max_depth': 6,
+            'subsample': 0.8,
+            'colsample_bytree': 0.8,
+            'random_state': 42,
+            'n_estimators': 300
+        }
+        
+        model = xgb.XGBClassifier(**params)
+        model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+        
+        self.models_config['xgb']['model'] = model
+        self.evaluate_model(model, X_test, y_test, 'XGBoost')
+
+    def train_svr(self, X_train, y_train, X_test, y_test):
+
+        print("Training SVR...")
+        
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        
+        sample_size = min(10000, len(X_train_scaled))
+        if sample_size < len(X_train_scaled):
+            indices = np.random.choice(len(X_train_scaled), sample_size, replace=False)
+            X_train_sampled = X_train_scaled[indices]
+            y_train_sampled = y_train.iloc[indices]
+        else:
+            X_train_sampled = X_train_scaled
+            y_train_sampled = y_train
+        
+        model = SVR(kernel='rbf', C=1.0, epsilon=0.1)
+        model.fit(X_train_sampled, y_train_sampled)
+        
+        self.models_config['svr']['model'] = {'model': model, 'scaler': scaler}
+        
+        y_pred = model.predict(X_test_scaled)
+        y_pred_binary = (y_pred > 0.5).astype(int)
+        
+        self.print_metrics_compatible(y_test, y_pred_binary, 'SVR')
+
+    def train_random_forest(self, X_train, y_train, X_test, y_test):
+
+        print("Training RandomForest...")
+        
+        model = RandomForestRegressor(
+            n_estimators=50,
+            max_depth=10,
+            min_samples_split=20,
+            random_state=42,
+            n_jobs=-1
+        )
+        model.fit(X_train, y_train)
+        
+        self.models_config['rf']['model'] = model
+        
+        y_pred = model.predict(X_test)
+        y_pred_binary = (y_pred > 0.5).astype(int)
+        
+        self.print_metrics_compatible(y_test, y_pred_binary, 'RandomForest')
+
+    def train_linear_regression(self, X_train, y_train, X_test, y_test):
+
+        print("Training LinearRegression...")
+        
+        model = LinearRegression()
+        model.fit(X_train, y_train)
+        
+        self.models_config['lr']['model'] = model
+        
+        y_pred = model.predict(X_test)
+        y_pred_binary = (y_pred > 0.5).astype(int)
+        
+        self.print_metrics_compatible(y_test, y_pred_binary, 'LinearRegression')
+
+    def create_ensemble_model(self, X_test, y_test):
+        """Build ensemble model."""
+        print("Building ensemble...")
+        
+        predictions = []
+        model_names = []
+        
+        if self.models_config['lgb']['model'] is not None:
+            lgb_pred = self.models_config['lgb']['model'].predict(X_test)
+            predictions.append(lgb_pred)
+            model_names.append('LightGBM')
+        
+        if self.models_config['xgb']['model'] is not None:
+            xgb_pred = self.models_config['xgb']['model'].predict_proba(X_test)[:, 1]
+            predictions.append(xgb_pred)
+            model_names.append('XGBoost')
+        
+        if self.models_config['svr']['model'] is not None:
+            svr_data = self.models_config['svr']['model']
+            scaler = svr_data['scaler']
+            svr_model = svr_data['model']
+            X_test_scaled = scaler.transform(X_test)
+            svr_pred = svr_model.predict(X_test_scaled)
+            svr_pred = (svr_pred - svr_pred.min()) / (svr_pred.max() - svr_pred.min() + 1e-8)
+            predictions.append(svr_pred)
+            model_names.append('SVR')
+        
+        if self.models_config['rf']['model'] is not None:
+            rf_pred = self.models_config['rf']['model'].predict(X_test)
+            rf_pred = (rf_pred - rf_pred.min()) / (rf_pred.max() - rf_pred.min() + 1e-8)
+            predictions.append(rf_pred)
+            model_names.append('RandomForest')
+        
+        if self.models_config['lr']['model'] is not None:
+            lr_pred = self.models_config['lr']['model'].predict(X_test)
+            lr_pred = (lr_pred - lr_pred.min()) / (lr_pred.max() - lr_pred.min() + 1e-8)
+            predictions.append(lr_pred)
+            model_names.append('LinearRegression')
+        
+        if len(predictions) == 0:
+            print("No available models for ensembling")
+            return
+        
+        weights = [0.35, 0.35, 0.1, 0.1, 0.1]
+        weights = weights[:len(predictions)]
+        
+        ensemble_pred = np.average(predictions, axis=0, weights=weights)
+        ensemble_pred_binary = (ensemble_pred > 0.5).astype(int)
+        
+        self.print_metrics_compatible(y_test, ensemble_pred_binary, 'Ensemble')
+        
+        self.models_config['ensemble']['model'] = {
+            'models': model_names,
+            'weights': weights
+        }
+
+    def evaluate_model(self, model, X_test, y_test, model_name):
+
+        if hasattr(model, 'predict_proba'):
+            y_pred_proba = model.predict_proba(X_test)[:, 1]
+        else:
+            y_pred_proba = model.predict(X_test)
+        
+        y_pred = (y_pred_proba > 0.5).astype(int)
+        self.print_metrics_compatible(y_test, y_pred, model_name)
+
+    def print_metrics_compatible(self, y_true, y_pred, model_name):
+        """Print metrics with zero_division-safe behavior."""
+        accuracy = accuracy_score(y_true, y_pred)
+        try:
+            precision = precision_score(y_true, y_pred, zero_division=0)
+            recall = recall_score(y_true, y_pred, zero_division=0)
+            f1 = f1_score(y_true, y_pred, zero_division=0)
+        except TypeError:
+            precision = precision_score(y_true, y_pred)
+            recall = recall_score(y_true, y_pred)
+            f1 = f1_score(y_true, y_pred)
+        
+        print(f"{model_name} - Acc: {accuracy:.4f}, Prec: {precision:.4f}, Rec: {recall:.4f}, F1: {f1:.4f}")
+
+    def save_all_models(self, selected_features):
+
+        print("Saving models...")
+        
+        model_data = {
+            'models': self.models_config,
+            'selected_features': selected_features,
+            'training_time': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'model_type': 'multi_model_ensemble'
+        }
+        
+        try:
+            with open('multi_model_ensemble.pkl', 'wb') as f:
+                pickle.dump(model_data, f)
+            print("Saved: multi_model_ensemble.pkl")
+            
+            import base64
+            model_bytes = pickle.dumps(model_data)
+            model_base64 = base64.b64encode(model_bytes).decode('utf-8')
+            with open('multi_model_ensemble.txt', 'w') as f:
+                f.write(model_base64)
+            print("Backup saved: multi_model_ensemble.txt")
+            
+        except Exception as e:
+            print(f"Failed to save models: {e}")
+
+# Simple test entry
+def test_multi_model():
+
+    print("=" * 60)
+    print("Start testing multi-model ensemble")
+    print("=" * 60)
+    
+    research = MultiModelResearch()
+    
+    print("Step 1: Generate training data...")
+    data, features = research.generate_training_data()
+    
+    print("Step 2: Train models...")
+    research.train_models()
+    
+    print("Test finished.")
+
+if __name__ == "__main__":
+    test_multi_model()
